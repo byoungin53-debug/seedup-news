@@ -7,11 +7,12 @@
 흐름: ①텔레그램 읽기 → ②링크 뽑기(본문·링크서식·미리보기) → ③유튜브·X·블로그 등 뉴스 아닌 것 버림
       → ④단축주소 풀기 → ⑤같은 기사 1건으로 합침 → ⑥제목·언론사·시각과 함께 저장
       → ⑦30일 지난 뉴스 삭제
-실행: 깃허브 액션이 매시간. 로컬 시험: DRY_RUN=1 python news_collect.py
+실행: 깃허브 액션이 3시간마다(형님 2026-09-08 결정). TOP3는 새 기사 3건 이상일 때 하이쿠 4.5로 선정. 로컬 시험: DRY_RUN=1 python news_collect.py
 비밀값: 환경변수로만 받는다 (TG_API_ID, TG_API_HASH, TG_STRING_SESSION, SEEDUP_BOT_EMAIL, SEEDUP_BOT_PW)
       — 코드·깃에 절대 안 넣는다 (CLAUDE.md 규칙 19).
 """
 import html
+import json
 import os
 import re
 import sys
@@ -22,8 +23,17 @@ import requests
 
 KST = timezone(timedelta(hours=9))
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
-WINDOW_MIN = int(os.environ.get("WINDOW_MIN") or "75")   # 최근 몇 분치를 읽나 (1시간 주기 + 15분 겹침, 중복은 표가 걸러줌)
+WINDOW_MIN = int(os.environ.get("WINDOW_MIN") or "195")  # 최근 몇 분치를 읽나 (3시간 주기 + 15분 겹침, 중복은 표가 걸러줌) — 2026-09-08 형님 "3시간마다"
 KEEP_DAYS = 30                                            # 보관 기간 [제안값 — 형님 확정 전]
+# ── TOP3 (2026-09-08 형님 결정: B안 AI 선정 / 실행마다(3시간) 갱신 / 3개 / 오류면 이전 것 유지) ──
+TOP_N = 3
+TOP_WINDOW_H = 24                     # "오늘" = 최근 24시간 [제안값]
+TOP_MODEL = os.environ.get("TOP_MODEL") or "claude-haiku-4-5"   # 값싼 모델 기본 [2026-09-08 비용 절감 — 형님 확정 전]
+TOP_MIN_NEW = int(os.environ.get("TOP_MIN_NEW") or "3")          # 새 기사가 이만큼 미만이면 AI를 안 부른다 (절감 설정 ①)
+TOP_MAX_CANDS = int(os.environ.get("TOP_MAX_CANDS") or "80")     # 후보 최대 개수 (절감 설정 ②: 최신순 80개)
+TOP_OBJ = "market/news_top3.json"     # 시드업 저장소(resources 버킷) 경로 — 홈 캘린더와 같은 방식, SQL 불필요
+TOP_CRITERIA = ("시드업 회원(국내·미국 주식에 투자하는 개인 투자자)에게 매매 판단에 영향이 큰 순서. "
+                "같은 주제는 하나만(다양성), 단순 홍보·연예·스포츠·정치 공방은 제외, 시장·산업·기업·금리·환율·정책 우선.")
 
 def need(k):
     v = (os.environ.get(k) or "").strip()
@@ -226,7 +236,7 @@ def collect():
     n_msgs = n_links = 0
     for cid in CHANNELS:
         try:
-            for m in client.iter_messages(cid, limit=300):
+            for m in client.iter_messages(cid, limit=600):   # 3시간치 여유
                 if m.date < since:
                     break
                 n_msgs += 1
@@ -330,18 +340,120 @@ def save(rows):
     return inserted
 
 
+# ═══ TOP3 — AI가 최근 24시간 기사 제목 중 3개를 고른다 ═══
+def _storage_get(token, obj):
+    r = requests.post(SEEDUP_URL + "/storage/v1/object/sign/resources/" + obj,
+                      headers={"apikey": SEEDUP_KEY, "Authorization": "Bearer " + token, "Content-Type": "application/json"},
+                      json={"expiresIn": 300}, timeout=30)
+    if not r.ok:
+        return None
+    r2 = requests.get(SEEDUP_URL + "/storage/v1" + r.json()["signedURL"], timeout=30)
+    return r2.json() if r2.ok else None
+
+
+def _storage_put(token, obj, data):
+    H = {"apikey": SEEDUP_KEY, "Authorization": "Bearer " + token}
+    requests.delete(SEEDUP_URL + "/storage/v1/object/resources/" + obj, headers=H, timeout=30)
+    r = requests.post(SEEDUP_URL + "/storage/v1/object/resources/" + obj,
+                      headers=dict(H, **{"Content-Type": "application/json"}),
+                      data=json.dumps(data, ensure_ascii=False).encode("utf-8"), timeout=60)
+    if not r.ok:
+        raise RuntimeError("TOP3 저장 실패 HTTP {} {}".format(r.status_code, r.text[:150]))
+    back = _storage_get(token, obj)
+    if not back or back.get("picked_at") != data.get("picked_at"):
+        raise RuntimeError("TOP3 저장 후 재확인 불일치")
+
+
+def pick_top3(inserted):
+    api_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if not api_key:
+        print("TOP3 건너뜀 — ANTHROPIC_API_KEY 없음")
+        return
+    token = seedup_login()
+    prev = _storage_get(token, TOP_OBJ) or {}
+    now = datetime.now(KST)
+    # 절감 설정 ①: 새 기사가 TOP_MIN_NEW 미만이고 이전 TOP3가 6시간 안쪽이면 AI를 부르지 않는다
+    if inserted < TOP_MIN_NEW and prev.get("picked_at"):
+        try:
+            age_h = (now - datetime.fromisoformat(prev["picked_at"])).total_seconds() / 3600
+            if age_h < 6:
+                print("TOP3 건너뜀 — 새 기사 {}건(<{}), 이전 선정 {:.1f}시간 전".format(inserted, TOP_MIN_NEW, age_h))
+                return
+        except Exception:
+            pass
+    H = {"apikey": SEEDUP_KEY, "Authorization": "Bearer " + token}
+    since = (datetime.now(timezone.utc) - timedelta(hours=TOP_WINDOW_H)).isoformat()
+    r = requests.get(SEEDUP_URL + "/rest/v1/news?select=id,title,source,domain,url,published_at&published_at=gte." + urllib.parse.quote(since)
+                     + "&order=published_at.desc&limit=" + str(TOP_MAX_CANDS), headers=H, timeout=30)
+    r.raise_for_status()
+    cands = r.json()
+    if len(cands) < TOP_N:
+        print("TOP3 건너뜀 — 후보 {}건뿐".format(len(cands)))
+        return
+    by_id = {c["id"]: c for c in cands}
+    # 절감 설정 ③: 시각을 빼고 id|언론사|제목(70자)만 보낸다 (입력 토큰 축소)
+    listing = "\n".join("{}|{}|{}".format(c["id"], c["source"], c["title"][:70]) for c in cands)
+    system = ("당신은 투자 커뮤니티의 뉴스 편집자다. 아래 기준으로 기사 {}개를 고른다.\n기준: {}\n"
+              "반드시 JSON 하나만 출력한다. 형식: {{\"top\": [{{\"id\": 숫자, \"reason\": \"20자 이내 한국어 한 줄\"}}, ...]}} "
+              "id는 목록에 있는 것만, 서로 다른 {}개, 중요한 순서대로.").format(TOP_N, TOP_CRITERIA, TOP_N)
+    user = "기사 목록 (id|언론사|제목, 최신순):\n" + listing
+    resp = requests.post("https://api.anthropic.com/v1/messages",
+                         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                         json={"model": TOP_MODEL, "max_tokens": 400, "system": system,
+                               "messages": [{"role": "user", "content": user}]}, timeout=120)
+    if not resp.ok:
+        raise RuntimeError("AI 호출 실패 HTTP {} {}".format(resp.status_code, resp.text[:150]))
+    j = resp.json()
+    text = "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text")
+    if j.get("stop_reason") == "max_tokens":
+        raise RuntimeError("AI 응답 잘림(max_tokens)")
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        raise RuntimeError("AI 응답에 JSON 없음: " + text[:120])
+    top = json.loads(m.group(0)).get("top") or []
+    items, seen = [], set()
+    for t in top:
+        try:
+            i = int(t.get("id"))
+        except Exception:
+            continue
+        if i in by_id and i not in seen:
+            seen.add(i)
+            c = by_id[i]
+            items.append({"id": i, "title": c["title"], "url": c["url"], "source": c["source"], "domain": c.get("domain", ""),
+                          "published_at": c["published_at"], "reason": str(t.get("reason") or "")[:40]})
+    if len(items) != TOP_N:
+        raise RuntimeError("AI가 고른 id 검증 실패 ({}개 유효): {}".format(len(items), text[:120]))
+    data = {"picked_at": now.isoformat(timespec="seconds"), "window_hours": TOP_WINDOW_H, "candidates": len(cands),
+            "model": TOP_MODEL, "items": items}
+    if DRY_RUN:
+        print("TOP3(DRY_RUN, 저장 안 함, 입력 {}·출력 {} 토큰):".format(j.get("usage", {}).get("input_tokens"), j.get("usage", {}).get("output_tokens")))
+        for k, it in enumerate(items, 1):
+            print("  {}. {} | {} — {}".format(k, it["source"], it["title"][:50], it["reason"]))
+        return
+    _storage_put(token, TOP_OBJ, data)
+    print("TOP3 저장 완료 (후보 {}건, 입력 {}·출력 {} 토큰):".format(len(cands), j.get("usage", {}).get("input_tokens"), j.get("usage", {}).get("output_tokens")))
+    for k, it in enumerate(items, 1):
+        print("  {}. {} | {} — {}".format(k, it["source"], it["title"][:50], it["reason"]))
+
+
 def main():
     rows = collect()
     rows.sort(key=lambda r: r["published_at"])
     for r in rows:
         print(" ", r["published_at"][11:16], "|", r["source"], "|", r["title"][:60], "|", r["url"][:70])
+    inserted = 0
     if DRY_RUN:
-        print("DRY_RUN — 저장 안 함")
-        return
-    if not rows:
+        print("DRY_RUN — 저장 안 함 (TOP3는 AI 호출만 하고 저장 안 함)")
+        inserted = len(rows)
+    elif not rows:
         print("저장할 뉴스 없음")
-        return
-    save(rows)
+    else:
+        inserted = save(rows)
+    try:
+        pick_top3(inserted)
+    except Exception as ex:
+        print("[TOP3 갱신 실패 — 이전 TOP3 유지]", str(ex)[:200])
 
 
 if __name__ == "__main__":

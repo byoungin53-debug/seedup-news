@@ -1,10 +1,10 @@
-# 시드업 뉴스 심부름꾼 — 텔레그램 채널의 언론사 기사 링크를 1시간마다 시드업 창고(news 표)에 저장
+# 시드업 뉴스 심부름꾼 — 텔레그램 채널의 언론사 기사 링크를 3시간마다 시드업 창고(news 표)에 저장 + AI TOP3 선정
 # 2026-09-08 형님 결정: 링크만, AI 없음, 미국장 포함 24시간, 전 회원 공개
 # 이 저장소는 공개(public)라 실행 시간이 무제한 무료. 비밀값은 전부 Settings → Secrets 에만 있다.
 name: seedup-news
 on:
   schedule:
-    - cron: '7 * * * *'   # 매시간 07분 (UTC 기준이지만 매시간이라 한국 시간도 매시간)
+    - cron: '7 */3 * * *'   # 3시간마다 07분 (UTC 0·3·6·9·12·15·18·21시 = 한국 09·12·15·18·21·00·03·06시) — 2026-09-08 형님 결정 "3시간마다"
   workflow_dispatch:
 
 permissions:
@@ -33,3 +33,4 @@ jobs:
           TG_STRING_SESSION: ${{ secrets.TG_STRING_SESSION }}
           SEEDUP_BOT_EMAIL: ${{ secrets.SEEDUP_BOT_EMAIL }}
           SEEDUP_BOT_PW: ${{ secrets.SEEDUP_BOT_PW }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}   # TOP3 선정용 (2026-09-08)
