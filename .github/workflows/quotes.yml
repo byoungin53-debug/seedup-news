@@ -1,0 +1,27 @@
+# 홈 「오늘의 증시」 지수 띠 — 네이버 무료 시세를 30분마다 시드업 저장소(market/quotes.json)에 저장. AI 없음.
+# 2026-09-08 형님 결정: 시안 3, 코스피·코스닥·S&P500·나스닥·다우, "업데이트는 당연히 되게"
+name: seedup-quotes
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: seedup-quotes
+  cancel-in-progress: true
+jobs:
+  quotes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install requests==2.32.3
+      - run: python quotes_collect.py
+        env:
+          SEEDUP_BOT_EMAIL: ${{ secrets.SEEDUP_BOT_EMAIL }}
+          SEEDUP_BOT_PW: ${{ secrets.SEEDUP_BOT_PW }}
