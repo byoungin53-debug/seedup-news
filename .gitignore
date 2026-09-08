@@ -1,0 +1,4 @@
+_*.txt
+__pycache__/
+*.session
+secrets*.json
